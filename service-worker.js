@@ -1,273 +1,234 @@
-// service-worker.js
-const CACHE_NAME = 'neotrade-v1.0.0';
-const CACHE_URLS = [
+// Service Worker for NeoTrade - Binance Futures Pro
+const CACHE_NAME = 'neotrade-v4';
+const STATIC_CACHE_NAME = 'neotrade-static-v4';
+const DYNAMIC_CACHE_NAME = 'neotrade-dynamic-v4';
+
+const STATIC_ASSETS = [
   '/',
   '/index.html',
   '/manifest.json',
-  'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css'
+  'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css',
+  'https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap'
 ];
 
 // Install event
-self.addEventListener('install', event => {
+self.addEventListener('install', (event) => {
   console.log('Service Worker installing...');
   event.waitUntil(
-    caches.open(CACHE_NAME)
-      .then(cache => cache.addAll(CACHE_URLS))
-      .then(() => self.skipWaiting())
+    caches.open(STATIC_CACHE_NAME).then((cache) => {
+      return cache.addAll(STATIC_ASSETS);
+    })
   );
+  self.skipWaiting();
 });
 
 // Activate event
-self.addEventListener('activate', event => {
+self.addEventListener('activate', (event) => {
   console.log('Service Worker activating...');
   event.waitUntil(
-    caches.keys().then(cacheNames => {
+    caches.keys().then((cacheNames) => {
       return Promise.all(
-        cacheNames.map(cacheName => {
-          if (cacheName !== CACHE_NAME) {
+        cacheNames.map((cacheName) => {
+          if (cacheName !== STATIC_CACHE_NAME && cacheName !== DYNAMIC_CACHE_NAME) {
             console.log('Deleting old cache:', cacheName);
             return caches.delete(cacheName);
           }
         })
       );
-    }).then(() => self.clients.claim())
+    })
   );
+  self.clients.claim();
 });
 
-// Fetch event with network-first strategy for API, cache-first for assets
-self.addEventListener('fetch', event => {
+// Fetch event with network-first strategy for API calls, cache-first for static assets
+self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   
-  // API requests - network first, then cache
-  if (url.pathname.includes('/api/') || url.hostname === 'fapi.binance.com') {
+  // Skip non-GET requests
+  if (event.request.method !== 'GET') return;
+  
+  // Handle API calls with network-first strategy
+  if (url.hostname.includes('binance.com') || 
+      url.hostname.includes('binance.me')) {
     event.respondWith(
       fetch(event.request)
-        .then(response => {
-          // Cache successful responses
-          if (response.status === 200) {
+        .then((response) => {
+          // Cache successful API responses for 30 seconds
+          if (response.ok) {
             const responseClone = response.clone();
-            caches.open(CACHE_NAME).then(cache => {
+            caches.open(DYNAMIC_CACHE_NAME).then((cache) => {
               cache.put(event.request, responseClone);
             });
           }
           return response;
         })
         .catch(() => {
-          // Fallback to cache if network fails
+          // If network fails, try cache
           return caches.match(event.request);
         })
     );
-  } else {
-    // Static assets - cache first
-    event.respondWith(
-      caches.match(event.request)
-        .then(response => response || fetch(event.request))
-    );
+    return;
   }
+  
+  // For static assets, use cache-first strategy
+  event.respondWith(
+    caches.match(event.request).then((cachedResponse) => {
+      if (cachedResponse) {
+        // Update cache in background
+        fetch(event.request).then((response) => {
+          if (response.ok) {
+            const responseToCache = response.clone();
+            caches.open(STATIC_CACHE_NAME).then((cache) => {
+              cache.put(event.request, responseToCache);
+            });
+          }
+        });
+        return cachedResponse;
+      }
+      
+      return fetch(event.request).then((response) => {
+        // Don't cache if not a successful response
+        if (!response || response.status !== 200 || response.type !== 'basic') {
+          return response;
+        }
+        
+        const responseToCache = response.clone();
+        caches.open(STATIC_CACHE_NAME).then((cache) => {
+          cache.put(event.request, responseToCache);
+        });
+        
+        return response;
+      });
+    })
+  );
 });
 
 // Background sync for offline trades
-self.addEventListener('sync', event => {
-  console.log('Background sync:', event.tag);
-  
-  if (event.tag === 'offline-trades') {
-    event.waitUntil(syncOfflineTrades());
-  }
-});
-
-// Periodic sync for market data
-self.addEventListener('periodicsync', event => {
-  if (event.tag === 'market-data-sync') {
-    console.log('Periodic sync for market data');
-    event.waitUntil(syncMarketData());
+self.addEventListener('sync', (event) => {
+  if (event.tag === 'sync-trades') {
+    console.log('Background sync: syncing trades...');
+    event.waitUntil(syncTrades());
   }
 });
 
 // Push notifications
-self.addEventListener('push', event => {
-  console.log('Push notification received:', event);
-  
-  let data = {};
-  try {
-    data = event.data.json();
-  } catch (e) {
-    data = {
-      title: 'NeoTrade',
-      body: event.data.text(),
-      icon: '/icon-192.png'
-    };
-  }
+self.addEventListener('push', (event) => {
+  const data = event.data ? event.data.json() : {};
   
   const options = {
-    body: data.body,
-    icon: data.icon || '/icon-192.png',
-    badge: '/badge-72.png',
+    body: data.body || 'New trade notification',
+    icon: '/icons/icon-192.png',
+    badge: '/icons/badge-72.png',
     vibrate: [100, 50, 100],
-    data: data.data || {},
+    data: {
+      dateOfArrival: Date.now(),
+      primaryKey: 'trade-notification',
+      tradeId: data.tradeId,
+      symbol: data.symbol,
+      type: data.type
+    },
     actions: [
       {
-        action: 'view-trade',
-        title: 'View Trade'
+        action: 'open',
+        title: 'Open Trade'
       },
       {
-        action: 'dismiss',
+        action: 'close',
         title: 'Dismiss'
       }
-    ],
-    requireInteraction: true
+    ]
   };
   
   event.waitUntil(
-    self.registration.showNotification(data.title || 'NeoTrade', options)
+    self.registration.showNotification(data.title || 'NeoTrade Alert', options)
   );
 });
 
-// Notification click handler
-self.addEventListener('notificationclick', event => {
-  console.log('Notification clicked:', event);
-  
+self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   
-  const notificationData = event.notification.data;
-  
-  if (event.action === 'view-trade' && notificationData.symbol) {
-    // Focus existing window or open new one
+  if (event.action === 'open' || event.action === 'open-trade') {
     event.waitUntil(
-      clients.matchAll({ type: 'window', includeUncontrolled: true })
-        .then(windowClients => {
-          if (windowClients.length > 0) {
-            const client = windowClients[0];
-            client.focus();
+      clients.matchAll({ type: 'window' }).then((clientList) => {
+        for (const client of clientList) {
+          if (client.url.includes('/') && 'focus' in client) {
             client.postMessage({
-              type: 'NOTIFICATION_CLICKED',
-              data: notificationData
+              type: 'notification-click',
+              action: 'open-trade',
+              tradeId: event.notification.data.tradeId,
+              symbol: event.notification.data.symbol
             });
-          } else {
-            clients.openWindow('/');
+            return client.focus();
           }
-        })
-    );
-  }
-});
-
-// Message handler from main thread
-self.addEventListener('message', event => {
-  console.log('Service Worker received message:', event.data);
-  
-  switch(event.data.type) {
-    case 'SEND_NOTIFICATION':
-      self.registration.showNotification(
-        event.data.data.title,
-        {
-          body: event.data.data.body,
-          icon: '/icon-192.png',
-          badge: '/badge-72.png',
-          data: event.data.data,
-          requireInteraction: true
         }
-      );
-      break;
-      
-    case 'SAVE_OFFLINE_DATA':
-      saveOfflineData(event.data.data);
-      break;
-      
-    case 'SYNC_NOW':
-      syncOfflineTrades();
-      break;
-  }
-});
-
-// Helper functions
-async function syncOfflineTrades() {
-  try {
-    const cache = await caches.open('offline-data');
-    const keys = await cache.keys();
-    const tradeRequests = keys.filter(key => key.url.includes('/api/trades'));
-    
-    const results = await Promise.allSettled(
-      tradeRequests.map(async request => {
-        const response = await cache.match(request);
-        const data = await response.json();
-        
-        // Send to server
-        const serverResponse = await fetch('/api/trades/sync', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(data)
-        });
-        
-        if (serverResponse.ok) {
-          await cache.delete(request);
-          return { success: true, data };
-        } else {
-          throw new Error('Sync failed');
+        if (clients.openWindow) {
+          return clients.openWindow('/');
         }
       })
     );
-    
-    const successCount = results.filter(r => r.status === 'fulfilled').length;
-    
-    // Notify main thread
-    self.clients.matchAll().then(clients => {
-      clients.forEach(client => {
-        client.postMessage({
-          type: 'SYNC_COMPLETED',
-          data: { synced: successCount, total: tradeRequests.length }
-        });
-      });
-    });
-    
-    console.log(`Synced ${successCount}/${tradeRequests.length} offline trades`);
-    
-  } catch (error) {
-    console.error('Sync failed:', error);
-    
-    self.clients.matchAll().then(clients => {
-      clients.forEach(client => {
-        client.postMessage({
-          type: 'SYNC_FAILED',
-          data: { error: error.message }
-        });
-      });
-    });
-    
-    throw error;
   }
-}
+});
 
-async function syncMarketData() {
+// Message event for communication with the app
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
+});
+
+// Functions for background tasks
+async function syncTrades() {
   try {
-    const response = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
-    const data = await response.json();
+    // Get all clients
+    const clients = await self.clients.matchAll();
     
-    const cache = await caches.open(CACHE_NAME);
-    await cache.put(
-      new Request('https://fapi.binance.com/fapi/v1/ticker/24hr'),
-      new Response(JSON.stringify(data))
-    );
-    
-    console.log('Market data synced');
-    
+    // Request trade data from each client
+    for (const client of clients) {
+      client.postMessage({
+        type: 'SYNC_TRADES_REQUEST'
+      });
+    }
   } catch (error) {
-    console.error('Market data sync failed:', error);
+    console.error('Background sync failed:', error);
   }
 }
 
-async function saveOfflineData(data) {
-  const cache = await caches.open('offline-data');
-  const timestamp = Date.now();
-  const request = new Request(`/api/offline/${timestamp}`);
-  const response = new Response(JSON.stringify(data));
-  
-  await cache.put(request, response);
-  
-  self.clients.matchAll().then(clients => {
-    clients.forEach(client => {
-      client.postMessage({
-        type: 'OFFLINE_DATA_SAVED',
-        data: { id: timestamp, type: data.type }
-      });
+// Check for version updates
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'GET_VERSION') {
+    event.ports[0].postMessage({
+      version: '4.0.0',
+      cacheName: CACHE_NAME
     });
-  });
+  }
+});
+
+// Clear old cache entries periodically
+async function cleanupOldCache() {
+  const cache = await caches.open(DYNAMIC_CACHE_NAME);
+  const requests = await cache.keys();
+  
+  const now = Date.now();
+  const maxAge = 30 * 60 * 1000; // 30 minutes
+  
+  for (const request of requests) {
+    const url = new URL(request.url);
+    
+    // Only clean Binance API calls
+    if (url.hostname.includes('binance.com')) {
+      const response = await cache.match(request);
+      if (response) {
+        const dateHeader = response.headers.get('date');
+        if (dateHeader) {
+          const fetchedDate = new Date(dateHeader).getTime();
+          if (now - fetchedDate > maxAge) {
+            await cache.delete(request);
+          }
+        }
+      }
+    }
+  }
 }
+
+// Run cleanup every hour
+setInterval(cleanupOldCache, 60 * 60 * 1000);
